@@ -6,6 +6,8 @@
 package main
 
 import (
+	"archive/zip"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -208,11 +210,21 @@ func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
 }
 
 func main() {
-	cr, err := config.GetConfigReader()
+	zipo := flag.String("zip", "", "if non-empty, zip xlsx into filename specified")
+	flag.Parse()
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] configfile\n\n", os.Args[0])
+
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+	cr, err := config.GetConfigReader(args[0])
 	if err != nil {
 		log.Fatal(err)
 
 	}
+	defer cr.Close()
 
 	dbc, err := config.GetDBConnection(cr)
 	if err != nil {
@@ -240,6 +252,18 @@ func main() {
 
 	wg := &sync.WaitGroup{}
 	wg.Add(len(testnames))
+	zipMu := &sync.Mutex{}
+	var zipr *zip.Writer
+	if *zipo != "" {
+		f, err := os.Create(*zipo)
+		if err != nil {
+			log.Println(err)
+		}
+		defer f.Close()
+
+		zipr = zip.NewWriter(f)
+		defer zipr.Close()
+	}
 	for _, test := range testnames {
 		// Using goroutines here is about 50% slower than the synchronous
 		// version, because it's thrashing the CPU cache. Leaving the
@@ -253,7 +277,29 @@ func main() {
 				log.Print(err)
 				return
 			}
-			f.Save(test.String() + ".xlsx")
+
+			if *zipo == "" {
+				// If not zipping, just write the xlsx per
+				// test name.
+				f.Save(test.String() + ".xlsx")
+			} else {
+				// Zipping, so acquire a lock to write to the
+				// zip file.
+				zipMu.Lock()
+				defer zipMu.Unlock()
+
+				zw, err := zipr.Create(test.String() + ".xlsx")
+				if err != nil {
+					log.Println(err)
+					return
+				}
+				err = f.Write(zw)
+				if err != nil {
+					log.Println(err)
+					return
+				}
+
+			}
 		}(test)
 	}
 	wg.Wait()
