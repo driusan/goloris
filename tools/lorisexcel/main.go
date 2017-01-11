@@ -6,13 +6,17 @@
 package main
 
 import (
-	"log"
-	"github.com/jmoiron/sqlx"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"regexp"
+	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/driusan/goloris/config"
+	"github.com/jmoiron/sqlx"
 	"github.com/tealeg/xlsx"
 )
 
@@ -21,6 +25,65 @@ type TestName string
 func (t TestName) String() string {
 	return string(t)
 }
+
+func fileExists(f string) bool {
+	_, err := os.Stat(f)
+
+	if err == nil {
+		return true
+	}
+
+	if os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+// Check if the instrument (contained in instrumentpath) should have validity
+// enabled. It is the caller's responsibility to verify that the instrument
+// exists before calling this function, otherwise it will return true
+func (t TestName) ValidityEnabled(instrumentpath string) (bool, error) {
+	// If the linst file exists, they always contain validity
+	if fileExists(instrumentpath + "/" + t.String() + ".linst") {
+		return true, nil
+	}
+
+	// If the PHP instrument exists, use a regex to search for
+	// 'ValidityEnabled = true'
+	// It's theoretically not as accurate as the PHP excel dump in edge cases,
+	// but in practice the only way this should get tripped up is if someone
+	// is trying to be malicious.
+	if file := instrumentpath + "/NDB_BVL_Instrument_" + t.String() + ".class.inc"; fileExists(file) {
+		f, err := ioutil.ReadFile(file)
+		if err != nil {
+			return false, err
+		}
+
+		matched, _ := regexp.Match("ValidityEnabled(\\s*)=(\\s*)true", f)
+		if matched {
+			return true, nil
+		}
+		matched, _ = regexp.Match(`ValidityEnabled(\s*)=(\s*)false`, f)
+		if matched {
+			return false, nil
+		}
+
+		// the default for instruments is true
+		return true, nil
+	}
+	return false, fmt.Errorf("No such instrument: %s", t)
+}
+
+// TODO: Move this to config package
+func getConfigFromDB(db *sqlx.DB, configname string) (string, error) {
+	var val string
+	err := db.QueryRow(
+		`SELECT Value FROM ConfigSettings cs JOIN Config c ON (cs.ID=c.ConfigID) WHERE cs.Name=?`,
+		configname,
+	).Scan(&val)
+	return val, err
+}
+
 // Gets all test names from the LORIS database that
 // db is connected to.
 func getAllTestNames(db *sqlx.DB) ([]TestName, error) {
@@ -45,59 +108,65 @@ func getAllTestNames(db *sqlx.DB) ([]TestName, error) {
 }
 
 func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
-
-	/*
-		PHP:
-		//Query to pull the data from the DB
-	$Test_name = $instrument['Test_name'];
-    if ($Test_name == 'prefrontal_task') {
-	    $query = "select c.PSCID, c.CandID, s.SubprojectID, s.Visit_label, s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration, e.full_name as Examiner_name, f.Data_entry, 'See validity_of_data field' as Validity, i.* from candidate c, session s, flag f, $Test_name i left outer join examiners e on i.Examiner = e.examinerID where c.PSCID not like 'dcc%' and c.PSCID not like '0%' and c.PSCID not like '1%' and c.PSCID not like '2%' and c.Entity_type != 'Scanner' and i.CommentID not like 'DDE%' and c.CandID = s.CandID and s.ID = f.sessionID and f.CommentID = i.CommentID AND c.Active='Y' AND s.Active='Y' order by s.Visit_label, c.PSCID";
-    } else if ($Test_name == 'radiology_review') {
-        $query = "select c.PSCID, c.CandID, s.SubprojectID, s.Visit_label, s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration, e.full_name as Examiner_name, f.Data_entry, f.Validity, 'Site review:', i.*, 'Final Review:', COALESCE(fr.Review_Done, 0) as Review_Done, fr.Final_Review_Results, fr.Final_Exclusionary, fr.Final_Incidental_Findings, fre.full_name as Final_Examiner_Name, fr.Final_Review_Results2, fre2.full_name as Final_Examiner2_Name, fr.Final_Exclusionary2, COALESCE(fr.Review_Done2, 0) as Review_Done2, fr.Final_Incidental_Findings2, fr.Finalized from candidate c, session s, flag f, $Test_name i left join final_radiological_review fr ON (fr.CommentID=i.CommentID) left outer join examiners e on (i.Examiner = e.examinerID) left join examiners fre ON (fr.Final_Examiner=fre.examinerID) left join examiners fre2 ON (fre2.examinerID=fr.Final_Examiner2) where c.PSCID not like 'dcc%' and c.PSCID not like '0%' and c.PSCID not like '1%' and c.PSCID not like '2%' and c.Entity_type != 'Scanner' and i.CommentID not like 'DDE%' and c.CandID = s.CandID and s.ID = f.sessionID and f.CommentID = i.CommentID AND c.Active='Y' AND s.Active='Y' order by s.Visit_label, c.PSCID";
-    } else {
-        if (is_file("../project/instruments/NDB_BVL_Instrument_$Test_name.class.inc")) {
-            $instrument =& NDB_BVL_Instrument::factory($Test_name, '', false);
-            if ($instrument->ValidityEnabled == true) {
-	            $query = "select c.PSCID, c.CandID, s.SubprojectID, s.Visit_label, s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration, e.full_name as Examiner_name, f.Data_entry, f.Validity, i.* from candidate c, session s, flag f, $Test_name i left outer join examiners e on i.Examiner = e.examinerID where c.PSCID not like 'dcc%' and c.PSCID not like '0%' and c.PSCID not like '1%' and c.PSCID not like '2%' and c.Entity_type != 'Scanner' and i.CommentID not like 'DDE%' and c.CandID = s.CandID and s.ID = f.sessionID and f.CommentID = i.CommentID AND c.Active='Y' AND s.Active='Y' order by s.Visit_label, c.PSCID";
-            } else {
-	            $query = "select c.PSCID, c.CandID, s.SubprojectID, s.Visit_label, s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration, e.full_name as Examiner_name, f.Data_entry, i.* from candidate c, session s, flag f, $Test_name i left outer join examiners e on i.Examiner = e.examinerID where c.PSCID not like 'dcc%' and c.PSCID not like '0%' and c.PSCID not like '1%' and c.PSCID not like '2%' and c.Entity_type != 'Scanner' and i.CommentID not like 'DDE%' and c.CandID = s.CandID and s.ID = f.sessionID and f.CommentID = i.CommentID AND c.Active='Y' AND s.Active='Y' order by s.Visit_label, c.PSCID";
-            }
-        } else {
-	    $query = "select c.PSCID, c.CandID, s.SubprojectID, s.Visit_label, s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration, e.full_name as Examiner_name, f.Data_entry, f.Validity, i.* from candidate c, session s, flag f, $Test_name i left outer join examiners e on i.Examiner = e.examinerID where c.PSCID not like 'dcc%' and c.PSCID not like '0%' and c.PSCID not like '1%' and c.PSCID not like '2%' and c.Entity_type != 'Scanner' and i.CommentID not like 'DDE%' and c.CandID = s.CandID and s.ID = f.sessionID and f.CommentID = i.CommentID AND c.Active='Y' AND s.Active='Y' order by s.Visit_label, c.PSCID";
-        }
-    }
-	$DB->select($query, $instrument_table);
-    MapSubprojectID($instrument_table);
-	writeExcel($Test_name, $instrument_table, $dataDir);
-	*/
-
-	var q string
+	var q, vldy string
 	switch t {
-		case "prefrontal_task":
-		case "radiology_review":
-		default:
-			// TODO: Use polymorphism to get the correct query.
-			linst := true
-			if linst {
-	    		q = `SELECT c.PSCID, c.CandID, s.SubprojectID, s.Visit_label,
-	s.Submitted, s.Current_stage, s.Screening, s.Visit, f.Administration,
-	e.full_name as Examiner_name, f.Data_entry, f.Validity, i.* from candidate c,
-	session s, flag f, ` + string(t) + ` i LEFT OUTER JOIN examiners e ON(i.Examiner = e.examinerID)
-	WHERE c.CenterID <> 1
-		AND c.Entity_type != 'Scanner' 
-		AND i.CommentID NOT LIKE 'DDE%' 
-		AND (c.CandID = s.CandID) and (s.ID = f.sessionID) AND (f.CommentID = i.CommentID)
-		AND c.Active='Y' AND s.Active='Y'
-	ORDER BY s.Visit_label, c.PSCID`;
-			} else {
-				// PHP instrument
-			}
+	case "prefrontal_task":
+		// Hack for IBIS. This is carried forward from the PHP excelDump
+		vldy = `'See validity_of_data field' as Validity, `
+	case "radiology_review":
+		// Hack to include radiological review columns in radiology_review dump
+		// (Carried over from PHP based excel dump)
+		q = `SELECT c.PSCID, c.CandID, sp.title as Subproject, s.Visit_label, s.Submitted,
+			s.Current_stage, s.Screening, s.Visit, f.Administration,
+			e.full_name as Examiner_name, f.Data_entry, f.Validity,
+			'Site review:', i.*,
+			'Final Review:', COALESCE(fr.Review_Done, 0) as Review_Done,
+			fr.Final_Review_Results, fr.Final_Exclusionary, fr.Final_Incidental_Findings,
+			fre.full_name as Final_Examiner_Name, fr.Final_Review_Results2,
+			fre2.full_name as Final_Examiner2_Name, fr.Final_Exclusionary2,
+			COALESCE(fr.Review_Done2, 0) as Review_Done2,
+			fr.Final_Incidental_Findings2, fr.Finalized
+		FROM candidate c JOIN session s ON (s.CandID=c.CandID)
+			LEFT JOIN subproject sp ON (s.SubprojectID=sp.SubprojectID)
+			JOIN flag f ON (s.ID=f.sessionID)
+			JOIN ` + t.String() + ` i ON (f.CommentID=i.CommentID)
+			LEFT JOIN final_radiological_review fr ON (fr.CommentID=i.CommentID)
+			LEFT JOIN examiners e on (i.Examiner = e.examinerID)
+			LEFT JOIN examiners fre ON (fr.Final_Examiner=fre.examinerID)
+			LEFT JOIN examiners fre2 ON (fre2.examinerID=fr.Final_Examiner2)
+		WHERE c.CenterID <> 1 AND c.Entity_type != 'Scanner'
+			AND i.CommentID NOT LIKE 'DDE%'
+			AND c.Active='Y' AND s.Active='Y'
+		ORDER BY s.Visit_label, c.PSCID`
+	default:
+		idir, err := getConfigFromDB(db, "base")
+		if idir == "" || err != nil {
+			return nil, fmt.Errorf("Could not find LORIS base directory.")
+		}
+		venabled, err := t.ValidityEnabled(idir + "/project/instruments")
+		if err != nil {
+			return nil, err
+		}
+		if vldy == "" && venabled {
+			vldy = "f.Validity, "
+		}
+
 	}
-
 	if q == "" {
-		return nil, fmt.Errorf("QUERY NOT SPECIFIED")
-	}	
-
+		q = `SELECT c.PSCID, c.CandID, sp.title as Subproject, s.Visit_label,
+				 s.Submitted, s.Current_stage, s.Screening, s.Visit,
+				f.Administration, e.full_name as Examiner_name,
+				f.Data_entry, ` + vldy + `i.*
+			FROM candidate c JOIN session s ON (s.CandID=c.CandID)
+			LEFT JOIN subproject sp ON (s.SubprojectID=sp.SubprojectID)
+				JOIN flag f ON (f.sessionID=s.ID)
+				JOIN ` + t.String() + ` i ON (f.CommentID=i.CommentID)
+				LEFT JOIN examiners e ON (i.Examiner = e.examinerID)
+			WHERE c.CenterID <> 1 AND c.Entity_type != 'Scanner' 
+				AND i.CommentID NOT LIKE 'DDE%' 
+				AND c.Active='Y' AND s.Active='Y'
+			ORDER BY s.Visit_label, c.PSCID`
+	}
 
 	rows, err := db.Queryx(q)
 	if err != nil {
@@ -107,12 +176,20 @@ func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
 
 	f := xlsx.NewFile()
 
-	sheet, err := f.AddSheet(string(t))
+	sheet, err := f.AddSheet(t.String())
 	if err != nil {
 		return nil, err
 	}
 
-	for row := 0; rows.Next(); row++ {
+	headers, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	for i, h := range headers {
+		sheet.Cell(0, i).Value = h
+	}
+	for row := 1; rows.Next(); row++ {
 		cols, err := rows.SliceScan()
 		if err != nil {
 			log.Print(err)
@@ -120,7 +197,11 @@ func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
 		}
 		for i, val := range cols {
 			c := sheet.Cell(row, i)
-			c.Value = fmt.Sprintf("%s", val)
+			if val != nil {
+				c.Value = fmt.Sprintf("%s", val)
+			} else {
+				c.Value = "."
+			}
 		}
 	}
 	return f, nil
@@ -152,26 +233,28 @@ func main() {
 	}
 	defer db.Close()
 
-	// Make sure the database connection is valid before
-	// going on, so that we don't need to wait until the
-	// first query to connect
-	if err := db.Ping(); err != nil {
-		log.Fatal(err)
-	}
-	
-
 	testnames, err := getAllTestNames(db)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	wg := &sync.WaitGroup{}
+	wg.Add(len(testnames))
 	for _, test := range testnames {
-		f, err := newFile(db, test)
+		// Using goroutines here is about 50% slower than the synchronous
+		// version, because it's thrashing the CPU cache. Leaving the
+		// closure for now (even if it's not using goroutines), so I can
+		//investigate why later..
+		func(test TestName) {
+			defer wg.Done()
+			f, err := newFile(db, test)
 
-		if err != nil {
-			log.Print(err)
-			continue
-		}
-		f.Save(test.String() + ".xlsx")
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			f.Save(test.String() + ".xlsx")
+		}(test)
 	}
-} 
+	wg.Wait()
+}
