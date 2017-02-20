@@ -1,8 +1,8 @@
 package config
 
 import (
-	"testing"
 	"strings"
+	"testing"
 
 	"encoding/xml"
 )
@@ -37,7 +37,6 @@ func TestGetDBConnection(t *testing.T) {
 `, DBConnInfo{XMLName: xml.Name{"", "database"}, Host: "127.0.0.1", Username: "testuser", Password: "fakepassword!", Database: "testdb"},
 		},
 	}
-
 
 	for i, tc := range testcases {
 		r := strings.NewReader(tc.XML)

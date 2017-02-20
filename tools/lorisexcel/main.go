@@ -115,6 +115,21 @@ func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
 	case "prefrontal_task":
 		// Hack for IBIS. This is carried forward from the PHP excelDump
 		vldy = `'See validity_of_data field' as Validity, `
+	case "candidate_info":
+		// Hack from old PHP excelDump. Add a candidate_info sheet.
+		q = `SELECT DISTINCT c.PSCID, c.CandID, c.Gender, c.DoB,
+			sp.Title as Subproject
+		FROM candidate c JOIN session s ON (c.CandID = s.CandID)
+			LEFT JOIN subproject sp ON (s.SubprojectID=sp.SubprojectID)
+		WHERE c.Active='Y' AND s.CenterID <> 1
+			AND s.CenterID IN (SELECT CenterID FROM psc WHERE Study_site='Y')
+		ORDER BY c.PSCID`
+	case "DataDictionary":
+		// Hack from old PHP excelDump. Add a data dictionary.
+		q = `SELECT Name, Type, Description, SourceField, SourceFrom 
+		FROM parameter_type 
+		WHERE SourceField IS NOT NULL
+		ORDER BY SourceFrom`
 	case "radiology_review":
 		// Hack to include radiological review columns in radiology_review dump
 		// (Carried over from PHP based excel dump)
@@ -211,6 +226,7 @@ func newFile(db *sqlx.DB, t TestName) (*xlsx.File, error) {
 
 func main() {
 	zipo := flag.String("zip", "", "if non-empty, zip xlsx into filename specified")
+	dir := flag.String("o", "", "specify an output directory to put the files generated")
 	flag.Parse()
 	args := flag.Args()
 	if len(args) < 1 {
@@ -225,6 +241,10 @@ func main() {
 
 	}
 	defer cr.Close()
+
+	if *dir != "" {
+		os.Chdir(*dir)
+	}
 
 	dbc, err := config.GetDBConnection(cr)
 	if err != nil {
@@ -249,6 +269,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	testnames = append(testnames, "candidate_info", "DataDictionary")
 
 	wg := &sync.WaitGroup{}
 	wg.Add(len(testnames))

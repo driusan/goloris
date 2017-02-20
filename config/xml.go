@@ -4,21 +4,20 @@ import (
 	"encoding/xml"
 	"io"
 
-"golang.org/x/net/html/charset"
+	"golang.org/x/net/html/charset"
 )
 
-type ConfigXML struct{
+type ConfigXML struct {
 	XMLName xml.Name `xml:"config"`
-	DB DBConnInfo
-
+	DB      DBConnInfo
 }
 
 type DBConnInfo struct {
-	XMLName xml.Name `xml:"database"`
-	Host     string `xml:"host"`
-	Username string `xml:"username"`
-	Password string `xml:"password"`
-	Database string `xml:"database"`
+	XMLName  xml.Name `xml:"database"`
+	Host     string   `xml:"host"`
+	Username string   `xml:"username"`
+	Password string   `xml:"password"`
+	Database string   `xml:"database"`
 }
 
 // GetDBConnection extracts the database connection information
